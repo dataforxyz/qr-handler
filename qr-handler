@@ -1,0 +1,250 @@
+#!/bin/bash
+# qr-handler — scan, read, and generate QR codes (incl. Wi-Fi login/share).
+# Built for Omarchy (Hyprland/Wayland) + iwd. Launched from walker (Super+Space).
+#
+#   deps: walker, iwctl (iwd), qrencode, grim, slurp, zbar (zbarimg), imv,
+#         wl-clipboard, pkexec, notify-send
+set -uo pipefail
+
+# ---- small helpers ----------------------------------------------------------
+
+note() { notify-send -a "QR Handler" "$1" "${2:-}"; }
+
+# Native-looking walker pickers (fall back to walker directly if helpers absent)
+pick() { # prompt option...
+  local prompt="$1"; shift
+  if command -v omarchy-menu-select >/dev/null; then
+    omarchy-menu-select "$prompt" "$@"
+  else
+    printf '%s\n' "$@" | walker --dmenu -p "$prompt…"
+  fi
+}
+ask() { # prompt  -> reads a line of text
+  if command -v omarchy-menu-input >/dev/null; then
+    omarchy-menu-input "$1"
+  else
+    : | walker --dmenu -p "$1…"
+  fi
+}
+
+# Strip ANSI colour codes from iwctl output
+deansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+wifi_device() {
+  local dev
+  dev=$(iwctl device list 2>/dev/null | deansi | awk '/station/{print $1; exit}')
+  [[ -n $dev ]] && { echo "$dev"; return; }
+  iwctl device list 2>/dev/null | deansi | awk 'NR>4 && $1 ~ /^(wl|wlan)/ {print $1; exit}'
+}
+
+current_ssid() { # dev
+  iwctl station "$1" show 2>/dev/null | deansi \
+    | awk -F'  +' '/Connected network/{print $3; exit}'
+}
+
+# Escape a value for the WIFI: QR payload (spec: backslash-escape \ ; , : )
+qr_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\\;/g; s/,/\\,/g; s/:/\\:/g'; }
+# Reverse: drop the escaping backslashes
+qr_unescape() { sed 's/\\\(.\)/\1/g'; }
+
+# Render WIFI string -> PNG (with the network name + password printed below the
+# QR), show it in imv, and copy the password to the clipboard.
+show_qr() { # ssid pass payload
+  local ssid="$1" pass="$2" payload="$3"
+  local qr final caption IM
+  qr=$(mktemp --suffix=.png)
+  if ! qrencode -o "$qr" -s 12 -m 2 "$payload"; then
+    note "Could not generate QR code"; return 1
+  fi
+
+  if [[ -n $pass ]]; then
+    caption="Network:  ${ssid}"$'\n'"Password:  ${pass}"
+  else
+    caption="Network:  ${ssid}"$'\n'"(open — no password)"
+  fi
+
+  final="$qr"
+  IM=$(command -v magick || command -v convert)
+  if [[ -n $IM ]]; then
+    local txt cap font fontargs=()
+    font=$(fc-match -f '%{file}' 'JetBrainsMono:bold' 2>/dev/null)
+    [[ -f $font ]] || font=$(fc-match -f '%{file}' 'monospace:bold' 2>/dev/null)
+    [[ -f $font ]] && fontargs=(-font "$font")
+    txt=$(mktemp --suffix=.png); cap=$(mktemp --suffix=.png)
+    # Render the caption auto-sized (no clipping), then stack it under the QR
+    # on a canvas as wide as whichever is wider — both stay centered.
+    if "$IM" -background white -fill black "${fontargs[@]}" -pointsize 26 \
+         label:"$caption" -bordercolor white -border 6x10 "$txt" 2>/dev/null \
+       && "$IM" "$qr" "$txt" -background white -gravity center -append \
+         -bordercolor white -border 20 "$cap" 2>/dev/null; then
+      final="$cap"
+    fi
+  fi
+
+  [[ -n $pass ]] && printf '%s' "$pass" | wl-copy
+  note "Wi-Fi: $ssid" "${pass:+Password copied to clipboard. }Scan the QR to join."
+  setsid imv "$final" >/dev/null 2>&1 &
+}
+
+# Rubber-band a screen region with slurp, screenshot it, decode the QR.
+# Echoes the decoded payload, or nothing on cancel/no-code.
+decode_region() {
+  command -v zbarimg >/dev/null || { note "Install zbar first" "sudo pacman -S zbar"; return 1; }
+  local region img data
+  region=$(slurp 2>/dev/null) || return 1
+  img=$(mktemp --suffix=.png)
+  grim -g "$region" "$img" 2>/dev/null || { note "Screenshot failed"; return 1; }
+  data=$(zbarimg -q --raw "$img" 2>/dev/null)
+  [[ -z $data ]] && { note "No QR code found in that area"; return 1; }
+  printf '%s' "$data"
+}
+
+# Open a live camera preview (zbarcam) and decode the first QR it sees.
+# The preview window closes itself once a code is read. Echoes the payload.
+decode_camera() {
+  command -v zbarcam >/dev/null || { note "Install zbar first" "sudo pacman -S zbar"; return 1; }
+  note "Camera scanning…" "Point the camera at the QR. The window closes when it reads one (Esc to cancel)."
+  local data
+  # -1/--oneshot: show the live preview, exit after the first code is decoded.
+  data=$(zbarcam --raw -1 /dev/video0 2>/dev/null)
+  [[ -z $data ]] && { note "No QR scanned"; return 1; }
+  printf '%s' "$data"
+}
+
+# ---- actions ----------------------------------------------------------------
+
+action_share() {
+  local dev ssid psk_file pass
+  dev=$(wifi_device)
+  [[ -z $dev ]] && { note "No Wi-Fi device found"; exit 1; }
+  ssid=$(current_ssid "$dev")
+  [[ -z $ssid ]] && { note "Not connected to any Wi-Fi"; exit 1; }
+
+  # iwd stores creds under /var/lib/iwd/<SSID>.psk (root-only). Try to read the
+  # plaintext passphrase; many networks are saved hashed-only and can't be read.
+  psk_file="/var/lib/iwd/${ssid}.psk"
+  pass=$(pkexec grep -h '^Passphrase=' "$psk_file" 2>/dev/null | head -1 | cut -d= -f2-)
+
+  if [[ -z $pass ]]; then
+    note "Couldn't auto-read the password for “$ssid”" \
+         "It may be stored hashed. Opening manual entry…"
+    action_manual "$ssid"
+    return
+  fi
+  show_qr "$ssid" "$pass" "WIFI:T:WPA;S:$(qr_escape "$ssid");P:$(qr_escape "$pass");;"
+}
+
+action_manual() { # [prefill-ssid]
+  local ssid pass
+  ssid="${1:-$(ask 'Wi-Fi name (SSID)')}"
+  [[ -z $ssid ]] && exit 0
+  pass=$(ask "Password for “$ssid” (blank = open)")
+  if [[ -z $pass ]]; then
+    show_qr "$ssid" "" "WIFI:T:nopass;S:$(qr_escape "$ssid");;"
+  else
+    show_qr "$ssid" "$pass" "WIFI:T:WPA;S:$(qr_escape "$ssid");P:$(qr_escape "$pass");;"
+  fi
+}
+
+# Take a decoded QR payload and join the Wi-Fi network it describes (iwd).
+connect_from_qr() { # data
+  local data="$1" norm ssid pass enc dev
+  [[ -z $data ]] && return 1
+
+  # Not a Wi-Fi QR? Just surface the decoded text.
+  if [[ ${data^^} != WIFI:* ]]; then
+    printf '%s' "$data" | wl-copy
+    note "Not a Wi-Fi QR (copied to clipboard)" "$data"
+    return 0
+  fi
+
+  norm=";${data#WIFI:}"
+  ssid=$(grep -oP '(?<=;S:)(?:\\.|[^;])*' <<<"$norm" | head -1 | qr_unescape)
+  pass=$(grep -oP '(?<=;P:)(?:\\.|[^;])*' <<<"$norm" | head -1 | qr_unescape)
+  enc=$(grep -oP  '(?<=;T:)(?:\\.|[^;])*' <<<"$norm" | head -1)
+  [[ -z $ssid ]] && { note "Couldn't parse Wi-Fi QR" "$data"; return 1; }
+
+  dev=$(wifi_device)
+  [[ -z $dev ]] && { note "No Wi-Fi device found"; return 1; }
+
+  note "Connecting to “$ssid”…"
+  iwctl station "$dev" scan >/dev/null 2>&1
+  sleep 2
+  if [[ -z $pass || ${enc,,} == nopass ]]; then
+    iwctl station "$dev" connect "$ssid" >/dev/null 2>&1
+  else
+    iwctl --passphrase "$pass" station "$dev" connect "$ssid" >/dev/null 2>&1
+  fi
+
+  sleep 2
+  if [[ "$(current_ssid "$dev")" == "$ssid" ]]; then
+    notify-send -a "QR Handler" -u normal "✅ Connected to “$ssid”" "You're online."
+  else
+    notify-send -a "QR Handler" -u critical "❌ Could not connect to “$ssid”" \
+      "Wrong password, or the network is out of range. Try again."
+  fi
+}
+
+action_scan_camera() { local d; d=$(decode_camera) || exit 0; connect_from_qr "$d"; }
+action_scan_screen() { local d; d=$(decode_region) || exit 0; connect_from_qr "$d"; }
+
+# Read a QR and ONLY report what it is + a suggested action. Nothing is run,
+# nothing is connected — just decode, copy to clipboard, and advise.
+inspect_data() { # data
+  local data="$1" kind suggest
+  [[ -z $data ]] && return 1
+
+  case "${data^^}" in
+    WIFI:*)
+      local ssid; ssid=$(grep -oP '(?<=;S:)(?:\\.|[^;])*' <<<";${data#WIFI:}" | head -1 | qr_unescape)
+      kind="Wi-Fi network"
+      suggest="To join “$ssid”, use one of the “log in” scan options." ;;
+    HTTP://*|HTTPS://*)
+      kind="Web link"
+      suggest="Looks safe to open in a browser — verify the domain first." ;;
+    MAILTO:*)   kind="Email address";  suggest="Compose an email to this address." ;;
+    TEL:*)      kind="Phone number";   suggest="Dial this number." ;;
+    BEGIN:VCARD*) kind="Contact card"; suggest="Add this contact to your address book." ;;
+    BEGIN:VEVENT*) kind="Calendar event"; suggest="Add this event to your calendar." ;;
+    OTPAUTH:*)  kind="2FA / TOTP secret"; suggest="Add to your authenticator app. Keep it private." ;;
+    BITCOIN:*|ETHEREUM:*) kind="Crypto payment request"; suggest="Double-check the address before sending." ;;
+    *)          kind="Plain text";     suggest="No action needed — text copied to clipboard." ;;
+  esac
+
+  printf '%s' "$data" | wl-copy
+  note "$kind (copied to clipboard)" "$data
+
+💡 $suggest"
+}
+
+action_inspect_camera() { local d; d=$(decode_camera) || exit 0; inspect_data "$d"; }
+action_inspect_screen() { local d; d=$(decode_region) || exit 0; inspect_data "$d"; }
+
+# ---- menu -------------------------------------------------------------------
+
+SHARE="📤  Show my Wi-Fi login QR"
+SCAN_CAM="📷  Log in — scan with camera (live preview)"
+SCAN_SCR="🖥️  Log in — scan an on-screen QR"
+INSP_CAM="🔎  Read a QR with camera (inspect, no action)"
+INSP_SCR="🔍  Read an on-screen QR (inspect, no action)"
+MANUAL="✍️  Make QR from typed details"
+
+case "${1:-menu}" in
+  share)          action_share ;;
+  scan-camera)    action_scan_camera ;;
+  scan-screen)    action_scan_screen ;;
+  inspect-camera) action_inspect_camera ;;
+  inspect-screen) action_inspect_screen ;;
+  manual)         action_manual ;;
+  menu|*)
+    choice=$(pick "QR Handler" "$SHARE" "$SCAN_CAM" "$SCAN_SCR" "$INSP_CAM" "$INSP_SCR" "$MANUAL")
+    case "$choice" in
+      "$SHARE")    action_share ;;
+      "$SCAN_CAM") action_scan_camera ;;
+      "$SCAN_SCR") action_scan_screen ;;
+      "$INSP_CAM") action_inspect_camera ;;
+      "$INSP_SCR") action_inspect_screen ;;
+      "$MANUAL")   action_manual ;;
+    esac
+    ;;
+esac
