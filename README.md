@@ -7,13 +7,16 @@ the listed tools). Launch it from your app launcher and:
 - 📤 **Show your Wi-Fi login QR** — renders the network you're on as a QR code
   with the SSID and password printed underneath, and copies the password to your
   clipboard.
-- 📷 **Log in by scanning a QR with your camera** — live preview, auto-connects.
-- 🖥️ **Log in by scanning a QR already on your screen** — rubber-band select it.
+- 📷 **Connect to Wi-Fi by scanning a QR with your camera** — live preview,
+  auto-connects.
+- 🖥️ **Connect to Wi-Fi by scanning a QR already on your screen** — rubber-band
+  select it.
 - 🔎 **Read any QR (camera or on-screen), no action** — decodes it, copies it,
   and tells you what it is (Wi-Fi, URL, contact, OTP secret, …) with a suggestion.
-- ✍️ **Make a QR from a typed SSID/password** — for sharing any network.
+- ✍️ **Create a QR code** — choose Wi-Fi, website/link, plain text, email,
+  phone call, SMS, or contact card.
 
-Wi-Fi connect/share uses **iwd** (`iwctl`). Everything else is generic.
+Wi-Fi connect/share uses **iwd** (`iwctl`). QR creation and inspection are generic.
 
 ## Screenshot
 
@@ -56,7 +59,7 @@ sudo pacman -S --needed qrencode zbar grim slurp imv imagemagick wl-clipboard li
 | `grim` + `slurp` | capturing an on-screen QR region |
 | `imv` | displaying generated QR codes |
 | `imagemagick` (`magick`) | captioning the QR with SSID/password |
-| `wl-clipboard` (`wl-copy`) | copying passwords / decoded text |
+| `wl-clipboard` (`wl-copy`) | copying passwords / generated payloads / decoded text |
 | `libnotify` (`notify-send`) | success / failure notifications |
 | `iwd` (`iwctl`) | Wi-Fi connect & reading the saved passphrase (Wi-Fi features only) |
 

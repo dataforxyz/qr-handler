@@ -47,25 +47,34 @@ qr_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\\;/g; s/,/\\,/g; s/:/\\:
 # Reverse: drop the escaping backslashes
 qr_unescape() { sed 's/\\\(.\)/\1/g'; }
 
-# Render WIFI string -> PNG (with the network name + password printed below the
-# QR), show it in imv, and copy the password to the clipboard.
-show_qr() { # ssid pass payload
-  local ssid="$1" pass="$2" payload="$3"
-  local qr final caption IM
+# Percent-encode text for URI query strings (mailto:, sms:, etc.).
+urlencode() {
+  local LC_ALL=C s="$1" out="" i c hex
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+vcard_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\\;/g; s/,/\\,/g; s/$/\\n/' | tr -d '\n' | sed 's/\\n$//'; }
+
+# Render any payload -> PNG, optionally caption it, show it in imv, and
+# optionally copy useful text to the clipboard.
+render_qr() { # payload title caption [copy_text] [notification_body]
+  local payload="$1" title="${2:-QR code}" caption="${3:-}" copy_text="${4-}" body="${5:-Scan or share this QR code.}"
+  local qr final IM
   qr=$(mktemp --suffix=.png)
   if ! qrencode -o "$qr" -s 12 -m 2 "$payload"; then
     note "Could not generate QR code"; return 1
   fi
 
-  if [[ -n $pass ]]; then
-    caption="Network:  ${ssid}"$'\n'"Password:  ${pass}"
-  else
-    caption="Network:  ${ssid}"$'\n'"(open — no password)"
-  fi
-
   final="$qr"
-  IM=$(command -v magick || command -v convert)
-  if [[ -n $IM ]]; then
+  IM=$(command -v magick || command -v convert || true)
+  if [[ -n $caption && -n $IM ]]; then
     local txt cap font fontargs=()
     font=$(fc-match -f '%{file}' 'JetBrainsMono:bold' 2>/dev/null)
     [[ -f $font ]] || font=$(fc-match -f '%{file}' 'monospace:bold' 2>/dev/null)
@@ -81,9 +90,25 @@ show_qr() { # ssid pass payload
     fi
   fi
 
-  [[ -n $pass ]] && printf '%s' "$pass" | wl-copy
-  note "Wi-Fi: $ssid" "${pass:+Password copied to clipboard. }Scan the QR to join."
+  [[ -n $copy_text ]] && printf '%s' "$copy_text" | wl-copy
+  note "$title" "$body"
   setsid imv "$final" >/dev/null 2>&1 &
+}
+
+# Render WIFI string -> PNG with the network name + password printed below the
+# QR, and copy the password to the clipboard when there is one.
+show_qr() { # ssid pass payload
+  local ssid="$1" pass="$2" payload="$3" caption copy_text body
+  if [[ -n $pass ]]; then
+    caption="Network:  ${ssid}"$'\n'"Password:  ${pass}"
+    copy_text="$pass"
+    body="Password copied to clipboard. Scan the QR to join."
+  else
+    caption="Network:  ${ssid}"$'\n'"(open — no password)"
+    copy_text=""
+    body="Scan the QR to join."
+  fi
+  render_qr "$payload" "Wi-Fi: $ssid" "$caption" "$copy_text" "$body"
 }
 
 # Rubber-band a screen region with slurp, screenshot it, decode the QR.
@@ -146,6 +171,106 @@ action_manual() { # [prefill-ssid]
   fi
 }
 
+create_url_qr() {
+  local url
+  url=$(ask "Website URL")
+  [[ -z $url ]] && exit 0
+  [[ $url =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]] || url="https://$url"
+  render_qr "$url" "Link QR created" "$url" "$url" "Link copied to clipboard."
+}
+
+create_text_qr() {
+  local text
+  text=$(ask "Text for QR")
+  [[ -z $text ]] && exit 0
+  render_qr "$text" "Text QR created" "$text" "$text" "Text copied to clipboard."
+}
+
+create_email_qr() {
+  local email subject body payload query="" sep="" caption
+  email=$(ask "Email address")
+  [[ -z $email ]] && exit 0
+  subject=$(ask "Subject (optional)")
+  body=$(ask "Body (optional)")
+
+  payload="mailto:$email"
+  if [[ -n $subject ]]; then
+    query+="subject=$(urlencode "$subject")"; sep="&"
+  fi
+  if [[ -n $body ]]; then
+    query+="${sep}body=$(urlencode "$body")"
+  fi
+  [[ -n $query ]] && payload+="?$query"
+
+  caption="Email:  $email"
+  [[ -n $subject ]] && caption+=$'\n'"Subject:  $subject"
+  render_qr "$payload" "Email QR created" "$caption" "$payload" "Mail link copied to clipboard."
+}
+
+create_phone_qr() {
+  local number payload
+  number=$(ask "Phone number")
+  [[ -z $number ]] && exit 0
+  payload="tel:$number"
+  render_qr "$payload" "Phone QR created" "Phone:  $number" "$payload" "Phone link copied to clipboard."
+}
+
+create_sms_qr() {
+  local number message payload caption
+  number=$(ask "SMS phone number")
+  [[ -z $number ]] && exit 0
+  message=$(ask "Message (optional)")
+  payload="sms:$number"
+  [[ -n $message ]] && payload+="?body=$(urlencode "$message")"
+  caption="SMS:  $number"
+  [[ -n $message ]] && caption+=$'\n'"Message:  $message"
+  render_qr "$payload" "SMS QR created" "$caption" "$payload" "SMS link copied to clipboard."
+}
+
+create_contact_qr() {
+  local name phone email org url payload caption
+  name=$(ask "Contact name")
+  [[ -z $name ]] && exit 0
+  phone=$(ask "Phone (optional)")
+  email=$(ask "Email (optional)")
+  org=$(ask "Organization (optional)")
+  url=$(ask "Website (optional)")
+
+  payload="BEGIN:VCARD"$'\n'"VERSION:3.0"$'\n'"FN:$(vcard_escape "$name")"
+  [[ -n $phone ]] && payload+=$'\n'"TEL:$(vcard_escape "$phone")"
+  [[ -n $email ]] && payload+=$'\n'"EMAIL:$(vcard_escape "$email")"
+  [[ -n $org ]] && payload+=$'\n'"ORG:$(vcard_escape "$org")"
+  [[ -n $url ]] && payload+=$'\n'"URL:$(vcard_escape "$url")"
+  payload+=$'\n'"END:VCARD"
+
+  caption="Contact:  $name"
+  [[ -n $phone ]] && caption+=$'\n'"Phone:  $phone"
+  [[ -n $email ]] && caption+=$'\n'"Email:  $email"
+  render_qr "$payload" "Contact QR created" "$caption" "$payload" "Contact card copied to clipboard."
+}
+
+action_create() {
+  local WIFI_QR URL_QR TEXT_QR EMAIL_QR PHONE_QR SMS_QR CONTACT_QR choice
+  WIFI_QR="📶  Wi-Fi login"
+  URL_QR="🌐  Website / link"
+  TEXT_QR="📝  Plain text"
+  EMAIL_QR="✉️  Email"
+  PHONE_QR="☎️  Phone call"
+  SMS_QR="💬  SMS message"
+  CONTACT_QR="👤  Contact card"
+
+  choice=$(pick "Create QR code" "$WIFI_QR" "$URL_QR" "$TEXT_QR" "$EMAIL_QR" "$PHONE_QR" "$SMS_QR" "$CONTACT_QR")
+  case "$choice" in
+    "$WIFI_QR")    action_manual ;;
+    "$URL_QR")     create_url_qr ;;
+    "$TEXT_QR")    create_text_qr ;;
+    "$EMAIL_QR")   create_email_qr ;;
+    "$PHONE_QR")   create_phone_qr ;;
+    "$SMS_QR")     create_sms_qr ;;
+    "$CONTACT_QR") create_contact_qr ;;
+  esac
+}
+
 # Take a decoded QR payload and join the Wi-Fi network it describes (iwd).
 connect_from_qr() { # data
   local data="$1" norm ssid pass enc dev
@@ -198,7 +323,7 @@ inspect_data() { # data
     WIFI:*)
       local ssid; ssid=$(grep -oP '(?<=;S:)(?:\\.|[^;])*' <<<";${data#WIFI:}" | head -1 | qr_unescape)
       kind="Wi-Fi network"
-      suggest="To join “$ssid”, use one of the “log in” scan options." ;;
+      suggest="To join “$ssid”, use one of the “Connect to Wi-Fi” scan options." ;;
     HTTP://*|HTTPS://*)
       kind="Web link"
       suggest="Looks safe to open in a browser — verify the domain first." ;;
@@ -223,11 +348,11 @@ action_inspect_screen() { local d; d=$(decode_region) || exit 0; inspect_data "$
 # ---- menu -------------------------------------------------------------------
 
 SHARE="📤  Show my Wi-Fi login QR"
-SCAN_CAM="📷  Log in — scan with camera (live preview)"
-SCAN_SCR="🖥️  Log in — scan an on-screen QR"
+SCAN_CAM="📷  Connect to Wi-Fi — scan with camera (live preview)"
+SCAN_SCR="🖥️  Connect to Wi-Fi — scan an on-screen QR"
 INSP_CAM="🔎  Read a QR with camera (inspect, no action)"
 INSP_SCR="🔍  Read an on-screen QR (inspect, no action)"
-MANUAL="✍️  Make QR from typed details"
+CREATE="✍️  Create a QR code"
 
 case "${1:-menu}" in
   share)          action_share ;;
@@ -236,15 +361,22 @@ case "${1:-menu}" in
   inspect-camera) action_inspect_camera ;;
   inspect-screen) action_inspect_screen ;;
   manual)         action_manual ;;
+  create)         action_create ;;
+  create-url)     create_url_qr ;;
+  create-text)    create_text_qr ;;
+  create-email)   create_email_qr ;;
+  create-phone)   create_phone_qr ;;
+  create-sms)     create_sms_qr ;;
+  create-contact) create_contact_qr ;;
   menu|*)
-    choice=$(pick "QR Handler" "$SHARE" "$SCAN_CAM" "$SCAN_SCR" "$INSP_CAM" "$INSP_SCR" "$MANUAL")
+    choice=$(pick "QR Handler" "$SHARE" "$SCAN_CAM" "$SCAN_SCR" "$INSP_CAM" "$INSP_SCR" "$CREATE")
     case "$choice" in
       "$SHARE")    action_share ;;
       "$SCAN_CAM") action_scan_camera ;;
       "$SCAN_SCR") action_scan_screen ;;
       "$INSP_CAM") action_inspect_camera ;;
       "$INSP_SCR") action_inspect_screen ;;
-      "$MANUAL")   action_manual ;;
+      "$CREATE")   action_create ;;
     esac
     ;;
 esac
