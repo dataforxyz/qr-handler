@@ -5,18 +5,23 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
-mkdir -p "$BIN_DIR" "$APP_DIR"
+ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 
 install -m 755 "$SRC/qr-handler" "$BIN_DIR/qr-handler"
+install -m 644 "$SRC/assets/qr-handler.png" "$ICON_DIR/qr-handler.png"
 # Write the .desktop with an absolute Exec so launchers always find it.
 sed "s|^Exec=.*|Exec=$BIN_DIR/qr-handler|" "$SRC/qr-handler.desktop" \
   > "$APP_DIR/qr-handler.desktop"
+command -v gtk-update-icon-cache >/dev/null && \
+  gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 command -v update-desktop-database >/dev/null && \
   update-desktop-database "$APP_DIR" 2>/dev/null || true
 
 echo "Installed:"
 echo "  $BIN_DIR/qr-handler"
 echo "  $APP_DIR/qr-handler.desktop"
+echo "  $ICON_DIR/qr-handler.png"
 
 # Friendly dependency check (Arch package names in parentheses).
 miss=()
