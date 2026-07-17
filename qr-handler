@@ -42,6 +42,15 @@ current_ssid() { # dev
     | awk -F'  +' '/Connected network/{print $3; exit}'
 }
 
+wait_for_ssid() { # dev ssid [timeout-seconds]
+  local dev="$1" expected="$2" timeout="${3:-15}" i
+  for ((i = 0; i < timeout; i++)); do
+    [[ "$(current_ssid "$dev")" == "$expected" ]] && return 0
+    sleep 1
+  done
+  [[ "$(current_ssid "$dev")" == "$expected" ]]
+}
+
 # Escape a value for the WIFI: QR payload (spec: backslash-escape \ ; , : )
 qr_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\\;/g; s/,/\\,/g; s/:/\\:/g'; }
 # Reverse: drop the escaping backslashes
@@ -301,8 +310,9 @@ connect_from_qr() { # data
     iwctl --passphrase "$pass" station "$dev" connect "$ssid" >/dev/null 2>&1
   fi
 
-  sleep 2
-  if [[ "$(current_ssid "$dev")" == "$ssid" ]]; then
+  # iwd may return from `station connect` while association is still in
+  # progress. Give it time to finish instead of reporting a false failure.
+  if wait_for_ssid "$dev" "$ssid" 15; then
     notify-send -a "QR Handler" -u normal "✅ Connected to “$ssid”" "You're online."
   else
     notify-send -a "QR Handler" -u critical "❌ Could not connect to “$ssid”" \
