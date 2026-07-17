@@ -42,6 +42,15 @@ current_ssid() { # dev
     | awk -F'  +' '/Connected network/{print $3; exit}'
 }
 
+wait_for_ssid() { # dev ssid [timeout-seconds]
+  local dev="$1" expected="$2" timeout="${3:-15}" i
+  for ((i = 0; i < timeout; i++)); do
+    [[ "$(current_ssid "$dev")" == "$expected" ]] && return 0
+    sleep 1
+  done
+  [[ "$(current_ssid "$dev")" == "$expected" ]]
+}
+
 # Escape a value for the WIFI: QR payload (spec: backslash-escape \ ; , : )
 qr_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/;/\\;/g; s/,/\\,/g; s/:/\\:/g'; }
 # Reverse: drop the escaping backslashes
@@ -273,7 +282,7 @@ action_create() {
 
 # Take a decoded QR payload and join the Wi-Fi network it describes (iwd).
 connect_from_qr() { # data
-  local data="$1" norm ssid pass enc dev
+  local data="$1" norm ssid pass enc dev attempt max_attempts=3
   [[ -z $data ]] && return 1
 
   # Not a Wi-Fi QR? Just surface the decoded text.
@@ -292,22 +301,31 @@ connect_from_qr() { # data
   dev=$(wifi_device)
   [[ -z $dev ]] && { note "No Wi-Fi device found"; return 1; }
 
-  note "Connecting to “$ssid”…"
-  iwctl station "$dev" scan >/dev/null 2>&1
-  sleep 2
-  if [[ -z $pass || ${enc,,} == nopass ]]; then
-    iwctl station "$dev" connect "$ssid" >/dev/null 2>&1
-  else
-    iwctl --passphrase "$pass" station "$dev" connect "$ssid" >/dev/null 2>&1
-  fi
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    note "Connecting to “$ssid”…" "Attempt $attempt of $max_attempts"
 
-  sleep 2
-  if [[ "$(current_ssid "$dev")" == "$ssid" ]]; then
-    notify-send -a "QR Handler" -u normal "✅ Connected to “$ssid”" "You're online."
-  else
-    notify-send -a "QR Handler" -u critical "❌ Could not connect to “$ssid”" \
-      "Wrong password, or the network is out of range. Try again."
-  fi
+    # Refresh the network list before every attempt. iwd can occasionally fail
+    # an association while roaming or while its previous scan is stale.
+    iwctl station "$dev" scan >/dev/null 2>&1
+    sleep 2
+
+    if [[ -z $pass || ${enc,,} == nopass ]]; then
+      iwctl station "$dev" connect "$ssid" >/dev/null 2>&1
+    else
+      iwctl --passphrase "$pass" station "$dev" connect "$ssid" >/dev/null 2>&1
+    fi
+
+    # Do not rapidly stack connect commands: allow this association attempt to
+    # finish, while returning immediately as soon as the target SSID connects.
+    if wait_for_ssid "$dev" "$ssid" 8; then
+      notify-send -a "QR Handler" -u normal "✅ Connected to “$ssid”" "You're online."
+      return 0
+    fi
+  done
+
+  notify-send -a "QR Handler" -u critical "❌ Could not connect to “$ssid”" \
+    "All $max_attempts attempts failed. Check the password and signal, then try again."
+  return 1
 }
 
 action_scan_camera() { local d; d=$(decode_camera) || exit 0; connect_from_qr "$d"; }
