@@ -68,10 +68,14 @@ falling back to your system monospace.
 
 ## Notes
 
-- **Reading your current Wi-Fi password** needs root (iwd stores it under
-  `/var/lib/iwd/`), so "Show my Wi-Fi login QR" triggers a `pkexec` prompt. If
-  the network was saved hashed-only, the password can't be recovered and the tool
-  falls back to manual entry.
+- **Reading your current Wi-Fi credential** needs root (iwd stores it under
+  `/var/lib/iwd/`), so "Show my Wi-Fi login QR" triggers a `pkexec` prompt.
+  When iwd retained the original passphrase, the QR and caption show it normally.
+  Some profiles contain only a derived 64-hex `PreSharedKey`; that one-way value
+  cannot be turned back into the original password, even as root, but it is an
+  equivalent WPA credential. The tool puts that network key in the QR and copies
+  it to the clipboard. Most Wi-Fi QR readers accept raw WPA keys; devices that do
+  not will still require manual entry of the original password.
 - Camera defaults to `/dev/video0`. Edit the script if your webcam is elsewhere.
 - Designed for installs where `~/.local/bin` is on `PATH`.
 

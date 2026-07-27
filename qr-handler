@@ -42,6 +42,44 @@ current_ssid() { # dev
     | awk -F'  +' '/Connected network/{print $3; exit}'
 }
 
+# Return the iwd profile path for a PSK-protected SSID. iwd uses the SSID
+# verbatim only for a restricted filename-safe character set; all other SSIDs
+# are stored as "=<lowercase UTF-8 hex>.psk".
+iwd_psk_file() { # ssid
+  local LC_ALL=C ssid="$1" name
+  if [[ $ssid =~ ^[a-zA-Z0-9_\ -]+$ ]]; then
+    name="$ssid"
+  else
+    name="=$(printf '%s' "$ssid" | od -An -tx1 | tr -d ' \n')"
+  fi
+  printf '/var/lib/iwd/%s.psk' "$name"
+}
+
+# Decode the escapes used by iwd's key-file format. In particular, a literal
+# backslash is stored as "\\", so returning the raw file value can produce an
+# invalid Wi-Fi QR for otherwise recoverable passphrases.
+iwd_unescape() { # value
+  local value="$1" out="" char next i
+  for ((i = 0; i < ${#value}; i++)); do
+    char=${value:i:1}
+    if [[ $char == "\\" && $((i + 1)) -lt ${#value} ]]; then
+      ((i++))
+      next=${value:i:1}
+      case "$next" in
+        s)  out+=" " ;;
+        t)  out+=$'\t' ;;
+        r)  out+=$'\r' ;;
+        n)  out+=$'\n' ;;
+        \\) out+="\\" ;;
+        *)  out+="\\$next" ;;
+      esac
+    else
+      out+="$char"
+    fi
+  done
+  printf '%s' "$out"
+}
+
 wait_for_ssid() { # dev ssid [timeout-seconds]
   local dev="$1" expected="$2" timeout="${3:-15}" i
   for ((i = 0; i < timeout; i++)); do
@@ -120,6 +158,16 @@ show_qr() { # ssid pass payload
   render_qr "$payload" "Wi-Fi: $ssid" "$caption" "$copy_text" "$body"
 }
 
+# iwd may retain only the derived 256-bit WPA key. The original passphrase is
+# not recoverable from it, but the key itself is an equivalent credential and
+# many Wi-Fi QR readers accept its standard 64-hex representation.
+show_psk_qr() { # ssid psk payload
+  local ssid="$1" psk="$2" payload="$3" caption
+  caption="Network:  ${ssid}"$'\n'"Network key (not original password):"$'\n'"${psk:0:32}"$'\n'"${psk:32}"
+  render_qr "$payload" "Wi-Fi: $ssid" "$caption" "$psk" \
+    "Network key copied. Most devices can scan this QR; some require the original password."
+}
+
 # Rubber-band a screen region with slurp, screenshot it, decode the QR.
 # Echoes the decoded payload, or nothing on cancel/no-code.
 decode_region() {
@@ -148,24 +196,40 @@ decode_camera() {
 # ---- actions ----------------------------------------------------------------
 
 action_share() {
-  local dev ssid psk_file pass
+  local dev ssid psk_file credentials status pass_line psk_line pass psk
   dev=$(wifi_device)
   [[ -z $dev ]] && { note "No Wi-Fi device found"; exit 1; }
   ssid=$(current_ssid "$dev")
   [[ -z $ssid ]] && { note "Not connected to any Wi-Fi"; exit 1; }
 
-  # iwd stores creds under /var/lib/iwd/<SSID>.psk (root-only). Try to read the
-  # plaintext passphrase; many networks are saved hashed-only and can't be read.
-  psk_file="/var/lib/iwd/${ssid}.psk"
-  pass=$(pkexec grep -h '^Passphrase=' "$psk_file" 2>/dev/null | head -1 | cut -d= -f2-)
+  # The profile is root-only, so this intentionally triggers one polkit prompt.
+  # Read both possible credential forms: prefer the original passphrase, but use
+  # the derived raw PSK when that is all iwd retained.
+  psk_file=$(iwd_psk_file "$ssid")
+  credentials=$(pkexec grep -h -E '^(Passphrase|PreSharedKey)=' "$psk_file" 2>/dev/null)
+  status=$?
+  case "$status" in
+    126) note "Authorization cancelled" "The Wi-Fi credential was not accessed."; return ;;
+    127) note "Could not authorize access" "A polkit authentication agent is required."; return ;;
+  esac
 
-  if [[ -z $pass ]]; then
-    note "Couldn't auto-read the password for “$ssid”" \
-         "It may be stored hashed. Opening manual entry…"
-    action_manual "$ssid"
+  pass_line=$(grep -m1 '^Passphrase=' <<<"$credentials" || true)
+  if [[ -n $pass_line ]]; then
+    pass=$(iwd_unescape "${pass_line#Passphrase=}")
+    show_qr "$ssid" "$pass" "WIFI:T:WPA;S:$(qr_escape "$ssid");P:$(qr_escape "$pass");;"
     return
   fi
-  show_qr "$ssid" "$pass" "WIFI:T:WPA;S:$(qr_escape "$ssid");P:$(qr_escape "$pass");;"
+
+  psk_line=$(grep -m1 '^PreSharedKey=' <<<"$credentials" || true)
+  psk=${psk_line#PreSharedKey=}
+  if [[ $psk =~ ^[[:xdigit:]]{64}$ ]]; then
+    show_psk_qr "$ssid" "$psk" "WIFI:T:WPA;S:$(qr_escape "$ssid");P:$psk;;"
+    return
+  fi
+
+  note "Couldn't read a shareable credential for “$ssid”" \
+       "The iwd profile has no passphrase or WPA network key. Opening manual entry…"
+  action_manual "$ssid"
 }
 
 action_manual() { # [prefill-ssid]
